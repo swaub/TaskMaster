@@ -7,10 +7,28 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <LangVersion>12</LangVersion>
+    
+    <!-- Self-contained deployment settings -->
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <PublishReadyToRun>true</PublishReadyToRun>
+    
+    <!-- Application metadata -->
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyTitle>TaskMaster - Enterprise Task Management</AssemblyTitle>
+    <AssemblyDescription>Professional task and routine management application</AssemblyDescription>
+    <AssemblyCompany>TaskMaster Development Team</AssemblyCompany>
+    <AssemblyProduct>TaskMaster</AssemblyProduct>
+    <Copyright>© 2024 TaskMaster Development Team</Copyright>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="8.0.10" />
   </ItemGroup>
 
 </Project>

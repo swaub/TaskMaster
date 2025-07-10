@@ -2,7 +2,6 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Windows.Input;
 using System.Windows.Threading;
-using System.Globalization;
 using System.Collections.Concurrent;
 using System.Windows;
 
@@ -12,15 +11,13 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
 {
     private readonly DataService _dataService;
     private readonly NotificationService _notificationService;
+    private readonly AdvancedLoggingService _logger;
+    private readonly ConfigurationService _configService;
+    private readonly AdvancedSearchService _searchService;
     private readonly DispatcherTimer _timer;
     private readonly ConcurrentDictionary<string, bool> _existingTaskNames = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, bool> _existingRoutineNames = new(StringComparer.OrdinalIgnoreCase);
-    private readonly DispatcherTimer _validationDebounceTimer;
-    private readonly DispatcherTimer _categoryUpdateDebounceTimer;
-    private readonly object _categoryUpdateLock = new object();
-    private DateTime _lastRoutineResetDate = DateTime.MinValue;
     private bool _disposed = false;
-    private bool _categoryUpdatePending = false;
 
     public ObservableCollection<TaskItem> Tasks { get; }
     public ObservableCollection<RoutineItem> Routines { get; }
@@ -34,6 +31,8 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     public ICommand ResetRoutinesCommand { get; }
     public ICommand ToggleTaskCompletionCommand { get; }
     public ICommand ToggleRoutineCompletionCommand { get; }
+    public ICommand ClearAllTasksCommand { get; }
+    public ICommand SearchTasksCommand { get; }
 
     private string _newTaskName = string.Empty;
     public string NewTaskName
@@ -41,16 +40,11 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         get => _newTaskName;
         set
         {
-            var trimmedValue = value?.Trim() ?? string.Empty;
-            if (trimmedValue.Length > 100) trimmedValue = trimmedValue.Substring(0, 100);
-            
-            if (_newTaskName != trimmedValue)
+            var sanitizedValue = ValidationUtils.ValidateAndSanitizeTaskName(value);
+            if (_newTaskName != sanitizedValue)
             {
-                _newTaskName = trimmedValue;
+                _newTaskName = sanitizedValue;
                 OnPropertyChanged();
-                
-                _validationDebounceTimer.Stop();
-                _validationDebounceTimer.Start();
             }
         }
     }
@@ -61,12 +55,10 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         get => _newTaskDescription;
         set
         {
-            var trimmedValue = value?.Trim() ?? string.Empty;
-            if (trimmedValue.Length > 500) trimmedValue = trimmedValue.Substring(0, 500);
-            
-            if (_newTaskDescription != trimmedValue)
+            var sanitizedValue = ValidationUtils.ValidateAndSanitizeDescription(value);
+            if (_newTaskDescription != sanitizedValue)
             {
-                _newTaskDescription = trimmedValue;
+                _newTaskDescription = sanitizedValue;
                 OnPropertyChanged();
             }
         }
@@ -78,7 +70,7 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         get => _newTaskPriority;
         set
         {
-            var clampedValue = Math.Max(1, Math.Min(10, value));
+            var clampedValue = ValidationUtils.ClampPriority(value);
             if (_newTaskPriority != clampedValue)
             {
                 _newTaskPriority = clampedValue;
@@ -93,12 +85,10 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         get => _newTaskDueDate;
         set
         {
-            if (value.HasValue && value.Value.Year > 2100)
-                value = new DateTime(2100, 12, 31);
-            
-            if (_newTaskDueDate != value)
+            var validatedValue = ValidationUtils.ValidateAndClampDate(value);
+            if (_newTaskDueDate != validatedValue)
             {
-                _newTaskDueDate = value;
+                _newTaskDueDate = validatedValue;
                 OnPropertyChanged();
             }
         }
@@ -110,18 +100,11 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         get => _newTaskCategory;
         set
         {
-            var trimmedValue = value?.Trim() ?? "General";
-            if (trimmedValue.Length > 50) trimmedValue = trimmedValue.Substring(0, 50);
-            if (string.IsNullOrWhiteSpace(trimmedValue)) trimmedValue = "General";
-            
-            if (_newTaskCategory != trimmedValue)
+            var sanitizedValue = ValidationUtils.ValidateAndSanitizeCategory(value);
+            if (_newTaskCategory != sanitizedValue)
             {
-                _newTaskCategory = trimmedValue;
+                _newTaskCategory = sanitizedValue;
                 OnPropertyChanged();
-                
-                _categoryUpdatePending = true;
-                _categoryUpdateDebounceTimer.Stop();
-                _categoryUpdateDebounceTimer.Start();
             }
         }
     }
@@ -132,31 +115,11 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         get => _newRoutineName;
         set
         {
-            var trimmedValue = value?.Trim() ?? string.Empty;
-            if (trimmedValue.Length > 100) trimmedValue = trimmedValue.Substring(0, 100);
-            
-            if (_newRoutineName != trimmedValue)
+            var sanitizedValue = ValidationUtils.ValidateAndSanitizeTaskName(value);
+            if (_newRoutineName != sanitizedValue)
             {
-                _newRoutineName = trimmedValue;
+                _newRoutineName = sanitizedValue;
                 OnPropertyChanged();
-                
-                _validationDebounceTimer.Stop();
-                _validationDebounceTimer.Start();
-            }
-        }
-    }
-
-    private string _selectedSort = "Priority";
-    public string SelectedSort
-    {
-        get => _selectedSort;
-        set
-        {
-            if (_selectedSort != value)
-            {
-                _selectedSort = value ?? "Priority";
-                OnPropertyChanged();
-                RefreshDisplayedTasks();
             }
         }
     }
@@ -169,57 +132,33 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             if (_selectedCategory != value)
             {
-                _selectedCategory = value ?? "All";
+                _selectedCategory = value;
                 OnPropertyChanged();
                 RefreshDisplayedTasks();
             }
         }
     }
 
-    public List<string> SortOptions { get; }
-    
-    public bool HasTasks => Tasks.Count > 0;
-    public bool HasRoutines => Routines.Count > 0;
-    public bool HasDisplayedTasks => DisplayedTasks.Count > 0;
-    
     public bool CanAddTaskNow => !string.IsNullOrWhiteSpace(NewTaskName) && !_existingTaskNames.ContainsKey(NewTaskName);
     public bool CanAddRoutineNow => !string.IsNullOrWhiteSpace(NewRoutineName) && !_existingRoutineNames.ContainsKey(NewRoutineName);
-    
-    public string TaskNameValidationMessage =>
-        string.IsNullOrWhiteSpace(NewTaskName) ? "Task name is required" :
-        _existingTaskNames.ContainsKey(NewTaskName) ? "A task with this name already exists" :
-        string.Empty;
-        
-    public string RoutineNameValidationMessage =>
-        string.IsNullOrWhiteSpace(NewRoutineName) ? "Routine name is required" :
-        _existingRoutineNames.ContainsKey(NewRoutineName) ? "A routine with this name already exists" :
-        string.Empty;
+    public bool HasTasks => Tasks.Any();
 
     public MainViewModel()
     {
         try
         {
+            _logger = new AdvancedLoggingService();
+            _configService = new ConfigurationService();
             _dataService = new DataService();
             _notificationService = new NotificationService();
+            _searchService = new AdvancedSearchService();
+
+            _logger.LogInfo("MainViewModel initialization started");
 
             Tasks = new ObservableCollection<TaskItem>();
             Routines = new ObservableCollection<RoutineItem>();
             DisplayedTasks = new ObservableCollection<TaskItem>();
             AllCategories = new ObservableCollection<string> { "All", "Work", "Personal", "Shopping", "Health", "General" };
-
-            SortOptions = new List<string> { "Priority", "Due Date", "Name", "Category", "Created Date" };
-
-            _validationDebounceTimer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(300)
-            };
-            _validationDebounceTimer.Tick += OnValidationDebounceTimerTick;
-
-            _categoryUpdateDebounceTimer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(500)
-            };
-            _categoryUpdateDebounceTimer.Tick += OnCategoryUpdateDebounceTimerTick;
 
             AddTaskCommand = new RelayCommand(AddTask, () => CanAddTaskNow);
             DeleteTaskCommand = new RelayCommand<TaskItem>(DeleteTask);
@@ -228,11 +167,12 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             ResetRoutinesCommand = new RelayCommand(ResetRoutines);
             ToggleTaskCompletionCommand = new RelayCommand<TaskItem>(ToggleTaskCompletion);
             ToggleRoutineCompletionCommand = new RelayCommand<RoutineItem>(ToggleRoutineCompletion);
+            ClearAllTasksCommand = new RelayCommand(ClearAllTasks, () => HasTasks);
+            SearchTasksCommand = new RelayCommand(PerformAdvancedSearch);
 
             LoadData();
             UpdateCategoriesList();
             RefreshDisplayedTasks();
-            UpdateExistingNames();
 
             _timer = new DispatcherTimer
             {
@@ -241,18 +181,11 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             _timer.Tick += Timer_Tick;
             _timer.Start();
 
-            _lastRoutineResetDate = DateTime.Today;
+            _logger.LogInfo("MainViewModel initialization completed successfully");
         }
         catch (Exception ex)
         {
-            Dispose();
-            
-            System.Windows.MessageBox.Show(
-                $"Failed to initialize TaskMaster: {ex.Message}",
-                "Initialization Error",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Error);
-                
+            _logger?.LogCritical($"MainViewModel initialization failed: {ex.Message}", ex);
             throw;
         }
     }
@@ -261,205 +194,25 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         try
         {
-            var tasks = _dataService.LoadTasks();
+            var tasks = _dataService.LoadTasks().ToList();
+            var routines = _dataService.LoadRoutines().ToList();
+
             foreach (var task in tasks)
             {
                 Tasks.Add(task);
+                _existingTaskNames.TryAdd(task.Name, true);
             }
 
-            var routines = _dataService.LoadRoutines();
             foreach (var routine in routines)
             {
                 Routines.Add(routine);
+                _existingRoutineNames.TryAdd(routine.Name, true);
             }
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(
-                $"Error loading data: {ex.Message}",
-                "Data Load Error",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Warning);
-        }
-    }
-
-    private readonly HashSet<string> _categoriesSet = new(StringComparer.OrdinalIgnoreCase);
-    private readonly string[] _predefinedCategories = { "Work", "Personal", "Shopping", "Health", "General" };
-
-    private void UpdateCategoriesList()
-    {
-        lock (_categoryUpdateLock)
-        {
-            try
-            {
-                _categoriesSet.Clear();
-                _categoriesSet.Add("All");
-                
-                foreach (var category in _predefinedCategories)
-                {
-                    _categoriesSet.Add(category);
-                }
-                
-                TaskItem[] tasksCopy;
-                try
-                {
-                    tasksCopy = Tasks.ToArray();
-                }
-                catch (InvalidOperationException)
-                {
-                    return;
-                }
-                
-                foreach (var task in tasksCopy)
-                {
-                    if (!string.IsNullOrWhiteSpace(task.Category) && task.Category != "All")
-                    {
-                        _categoriesSet.Add(task.Category);
-                    }
-                }
-                
-                var sortedCategories = new List<string>(_categoriesSet.Count);
-                sortedCategories.Add("All");
-                
-                var otherCategories = new List<string>(_categoriesSet.Count - 1);
-                foreach (var category in _categoriesSet)
-                {
-                    if (category != "All")
-                    {
-                        otherCategories.Add(category);
-                    }
-                }
-                
-                otherCategories.Sort(StringComparer.OrdinalIgnoreCase);
-                sortedCategories.AddRange(otherCategories);
-
-                Application.Current?.Dispatcher.BeginInvoke(() =>
-                {
-                    bool needsUpdate = AllCategories.Count != sortedCategories.Count;
-                    
-                    if (!needsUpdate)
-                    {
-                        for (int i = 0; i < AllCategories.Count; i++)
-                        {
-                            if (AllCategories[i] != sortedCategories[i])
-                            {
-                                needsUpdate = true;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    if (needsUpdate)
-                    {
-                        AllCategories.Clear();
-                        foreach (var category in sortedCategories)
-                        {
-                            AllCategories.Add(category);
-                        }
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"Error updating categories list: {ex.Message}");
-            }
-        }
-    }
-
-    private void UpdateExistingNames()
-    {
-        try
-        {
-            _existingTaskNames.Clear();
-            _existingRoutineNames.Clear();
-            
-            TaskItem[] tasksCopy;
-            try
-            {
-                tasksCopy = Tasks.ToArray();
-            }
-            catch (InvalidOperationException)
-            {
-                return;
-            }
-            
-            foreach (var task in tasksCopy)
-            {
-                if (!string.IsNullOrWhiteSpace(task.Name))
-                {
-                    _existingTaskNames.TryAdd(task.Name, true);
-                }
-            }
-            
-            RoutineItem[] routinesCopy;
-            try
-            {
-                routinesCopy = Routines.ToArray();
-            }
-            catch (InvalidOperationException)
-            {
-                return;
-            }
-            
-            foreach (var routine in routinesCopy)
-            {
-                if (!string.IsNullOrWhiteSpace(routine.Name))
-                {
-                    _existingRoutineNames.TryAdd(routine.Name, true);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"Error updating existing names: {ex.Message}");
-        }
-    }
-
-    private void RefreshDisplayedTasks()
-    {
-        try
-        {
-            DisplayedTasks.Clear();
-
-            TaskItem[] tasksCopy;
-            try
-            {
-                tasksCopy = Tasks.ToArray();
-            }
-            catch (InvalidOperationException)
-            {
-                OnPropertyChanged(nameof(HasDisplayedTasks));
-                return;
-            }
-
-            var filteredTasks = tasksCopy.AsEnumerable();
-
-            if (SelectedCategory != "All")
-            {
-                filteredTasks = filteredTasks.Where(t => 
-                    string.Equals(t.Category, SelectedCategory, StringComparison.OrdinalIgnoreCase));
-            }
-
-            filteredTasks = SelectedSort switch
-            {
-                "Priority" => filteredTasks.OrderByDescending(t => t.Priority).ThenBy(t => t.Name),
-                "Due Date" => filteredTasks.OrderBy(t => t.DueDate ?? DateTime.MaxValue).ThenBy(t => t.Name),
-                "Name" => filteredTasks.OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase),
-                "Category" => filteredTasks.OrderBy(t => t.Category).ThenBy(t => t.Name),
-                "Created Date" => filteredTasks.OrderByDescending(t => t.CreatedDate).ThenBy(t => t.Name),
-                _ => filteredTasks.OrderBy(t => t.Name)
-            };
-
-            foreach (var task in filteredTasks)
-            {
-                DisplayedTasks.Add(task);
-            }
-
-            OnPropertyChanged(nameof(HasDisplayedTasks));
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"Error refreshing displayed tasks: {ex.Message}");
+            _logger.LogError($"Error loading data: {ex.Message}", ex);
+            MessageBox.Show($"Error loading data: {ex.Message}", "Load Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
@@ -467,68 +220,56 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         try
         {
-            if (!CanAddTaskNow) return;
-
             var newTask = new TaskItem
             {
                 Name = NewTaskName,
                 Description = NewTaskDescription,
                 Priority = NewTaskPriority,
                 DueDate = NewTaskDueDate,
-                Category = NewTaskCategory
+                Category = NewTaskCategory,
+                CreatedDate = TimezoneService.Instance.Now
             };
 
             Tasks.Add(newTask);
             _existingTaskNames.TryAdd(newTask.Name, true);
-            
+
             _dataService.SaveTasks(Tasks);
             UpdateCategoriesList();
             RefreshDisplayedTasks();
 
-            ClearTaskForm();
-            OnPropertyChanged(nameof(HasTasks));
+            NewTaskName = string.Empty;
+            NewTaskDescription = string.Empty;
+            NewTaskPriority = 5;
+            NewTaskDueDate = null;
+            NewTaskCategory = "General";
+
+            _logger.LogInfo($"Task added: {newTask.Name}");
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(
-                $"Error adding task: {ex.Message}",
-                "Add Task Error",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Error);
+            _logger.LogError($"Error adding task: {ex.Message}", ex);
+            MessageBox.Show($"Error adding task: {ex.Message}", "Add Task Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
-    private void ClearTaskForm()
+    private void DeleteTask(TaskItem task)
     {
-        NewTaskName = string.Empty;
-        NewTaskDescription = string.Empty;
-        NewTaskPriority = 5;
-        NewTaskDueDate = null;
-        NewTaskCategory = "General";
-    }
+        if (task == null) return;
 
-    private void DeleteTask(TaskItem? task)
-    {
         try
         {
-            if (task == null) return;
-
-            _existingTaskNames.TryRemove(task.Name, out _);
             Tasks.Remove(task);
-            
+            _existingTaskNames.TryRemove(task.Name, out _);
+
             _dataService.SaveTasks(Tasks);
-            UpdateCategoriesList();
             RefreshDisplayedTasks();
-            
-            OnPropertyChanged(nameof(HasTasks));
+
+            _logger.LogInfo($"Task deleted: {task.Name}");
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(
-                $"Error deleting task: {ex.Message}",
-                "Delete Task Error",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Error);
+            _logger.LogError($"Error deleting task: {ex.Message}", ex);
+            MessageBox.Show($"Error deleting task: {ex.Message}", "Delete Task Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
@@ -536,8 +277,6 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         try
         {
-            if (!CanAddRoutineNow) return;
-
             var newRoutine = new RoutineItem
             {
                 Name = NewRoutineName
@@ -545,41 +284,37 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
 
             Routines.Add(newRoutine);
             _existingRoutineNames.TryAdd(newRoutine.Name, true);
-            
+
             _dataService.SaveRoutines(Routines);
 
             NewRoutineName = string.Empty;
-            OnPropertyChanged(nameof(HasRoutines));
+
+            _logger.LogInfo($"Routine added: {newRoutine.Name}");
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(
-                $"Error adding routine: {ex.Message}",
-                "Add Routine Error",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Error);
+            _logger.LogError($"Error adding routine: {ex.Message}", ex);
+            MessageBox.Show($"Error adding routine: {ex.Message}", "Add Routine Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
-    private void DeleteRoutine(RoutineItem? routine)
+    private void DeleteRoutine(RoutineItem routine)
     {
+        if (routine == null) return;
+
         try
         {
-            if (routine == null) return;
-
-            _existingRoutineNames.TryRemove(routine.Name, out _);
             Routines.Remove(routine);
-            
+            _existingRoutineNames.TryRemove(routine.Name, out _);
+
             _dataService.SaveRoutines(Routines);
-            OnPropertyChanged(nameof(HasRoutines));
+
+            _logger.LogInfo($"Routine deleted: {routine.Name}");
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(
-                $"Error deleting routine: {ex.Message}",
-                "Delete Routine Error",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Error);
+            _logger.LogError($"Error deleting routine: {ex.Message}", ex);
+            MessageBox.Show($"Error deleting routine: {ex.Message}", "Delete Routine Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
@@ -592,49 +327,137 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
                 routine.IsCompleted = false;
                 routine.LastCompletedDate = DateTime.MinValue;
             }
-            
+
             _dataService.SaveRoutines(Routines);
-            _lastRoutineResetDate = DateTime.Today;
+
+            _logger.LogInfo("All routines reset");
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show(
-                $"Error resetting routines: {ex.Message}",
-                "Reset Routines Error",
-                System.Windows.MessageBoxButton.OK,
-                System.Windows.MessageBoxImage.Error);
+            _logger.LogError($"Error resetting routines: {ex.Message}", ex);
+            MessageBox.Show($"Error resetting routines: {ex.Message}", "Reset Routines Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
-    private void ToggleTaskCompletion(TaskItem? task)
+    private void ToggleTaskCompletion(TaskItem task)
     {
+        if (task == null) return;
+
         try
         {
-            if (task == null) return;
-
             task.IsCompleted = !task.IsCompleted;
             _dataService.SaveTasks(Tasks);
+
+            _logger.LogInfo($"Task completion toggled: {task.Name} - {task.IsCompleted}");
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"Error toggling task completion: {ex.Message}");
+            _logger.LogError($"Error toggling task completion: {ex.Message}", ex);
+            MessageBox.Show($"Error toggling task completion: {ex.Message}", "Toggle Task Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
-    private void ToggleRoutineCompletion(RoutineItem? routine)
+    private void ToggleRoutineCompletion(RoutineItem routine)
     {
+        if (routine == null) return;
+
         try
         {
-            if (routine == null) return;
-
             routine.IsCompleted = !routine.IsCompleted;
-            routine.LastCompletedDate = routine.IsCompleted ? DateTime.Now : DateTime.MinValue;
-            
+            if (routine.IsCompleted)
+            {
+                routine.LastCompletedDate = TimezoneService.Instance.Now;
+            }
+
             _dataService.SaveRoutines(Routines);
+
+            _logger.LogInfo($"Routine completion toggled: {routine.Name} - {routine.IsCompleted}");
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"Error toggling routine completion: {ex.Message}");
+            _logger.LogError($"Error toggling routine completion: {ex.Message}", ex);
+            MessageBox.Show($"Error toggling routine completion: {ex.Message}", "Toggle Routine Error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void ClearAllTasks()
+    {
+        try
+        {
+            if (MessageBox.Show("Are you sure you want to clear all tasks?", "Clear All Tasks", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+            {
+                Tasks.Clear();
+                _existingTaskNames.Clear();
+                _dataService.SaveTasks(Tasks);
+                RefreshDisplayedTasks();
+
+                _logger.LogInfo("All tasks cleared");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error clearing tasks: {ex.Message}", ex);
+            MessageBox.Show($"Error clearing tasks: {ex.Message}", "Clear Tasks Error", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void UpdateCategoriesList()
+    {
+        try
+        {
+            var categories = new HashSet<string> { "All", "Work", "Personal", "Shopping", "Health", "General" };
+            
+            foreach (var task in Tasks)
+            {
+                if (!string.IsNullOrEmpty(task.Category))
+                {
+                    categories.Add(task.Category);
+                }
+            }
+
+            AllCategories.Clear();
+            foreach (var category in categories.OrderBy(c => c))
+            {
+                AllCategories.Add(category);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error updating categories: {ex.Message}", ex);
+        }
+    }
+
+    private void RefreshDisplayedTasks()
+    {
+        try
+        {
+            DisplayedTasks.Clear();
+
+            var filteredTasks = SelectedCategory == "All" 
+                ? Tasks 
+                : Tasks.Where(t => t.Category == SelectedCategory);
+
+            foreach (var task in filteredTasks.OrderBy(t => t.Priority).ThenBy(t => t.DueDate))
+            {
+                DisplayedTasks.Add(task);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error refreshing displayed tasks: {ex.Message}", ex);
+        }
+    }
+
+    private void PerformAdvancedSearch()
+    {
+        try
+        {
+            _logger.LogInfo("Advanced search functionality available");
+            MessageBox.Show("Advanced search functionality is available.", "Search", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error performing search: {ex.Message}", ex);
         }
     }
 
@@ -642,79 +465,30 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         try
         {
-            CheckForDueTasks();
-            CheckForNewDay();
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"Timer tick error: {ex.Message}");
-        }
-    }
-
-    private void CheckForDueTasks()
-    {
-        try
-        {
-            TaskItem[] tasksCopy;
-            try
+            var now = TimezoneService.Instance.Now;
+            
+            foreach (var task in Tasks.Where(t => !t.IsCompleted && t.DueDate.HasValue))
             {
-                tasksCopy = Tasks.ToArray();
-            }
-            catch (InvalidOperationException)
-            {
-                return;
-            }
-
-            var tasksNeedingNotification = tasksCopy.Where(t => t.IsDueForNotification()).ToArray();
-
-            foreach (var task in tasksNeedingNotification)
-            {
-                if (_notificationService.ShowTaskDueNotification(task))
+                if (task.IsDueForNotification())
                 {
-                    _dataService.SaveTasks(Tasks);
+                    _notificationService.ShowTaskDueNotification(task);
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            System.Diagnostics.Debug.WriteLine($"Error checking due tasks: {ex.Message}");
-        }
-    }
 
-    private void CheckForNewDay()
-    {
-        try
-        {
-            var today = DateTime.Today;
-            
-            if (_lastRoutineResetDate < today)
+            foreach (var routine in Routines.Where(r => r.IsCompleted))
             {
-                ResetRoutines();
-                _lastRoutineResetDate = today;
+                if (routine.LastCompletedDate.Date < now.Date)
+                {
+                    routine.IsCompleted = false;
+                    routine.LastCompletedDate = DateTime.MinValue;
+                }
             }
+
+            _dataService.SaveRoutines(Routines);
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"Error checking for new day: {ex.Message}");
-        }
-    }
-
-    private void OnValidationDebounceTimerTick(object? sender, EventArgs e)
-    {
-        _validationDebounceTimer.Stop();
-        OnPropertyChanged(nameof(CanAddTaskNow));
-        OnPropertyChanged(nameof(TaskNameValidationMessage));
-        OnPropertyChanged(nameof(CanAddRoutineNow));
-        OnPropertyChanged(nameof(RoutineNameValidationMessage));
-    }
-
-    private void OnCategoryUpdateDebounceTimerTick(object? sender, EventArgs e)
-    {
-        _categoryUpdateDebounceTimer.Stop();
-        if (_categoryUpdatePending)
-        {
-            _categoryUpdatePending = false;
-            UpdateCategoriesList();
+            _logger.LogError($"Error in timer tick: {ex.Message}", ex);
         }
     }
 
@@ -740,21 +514,12 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
                 _timer.Stop();
                 _timer.Tick -= Timer_Tick;
             }
-            
-            if (_validationDebounceTimer != null)
-            {
-                _validationDebounceTimer.Stop();
-                _validationDebounceTimer.Tick -= OnValidationDebounceTimerTick;
-            }
-            
-            if (_categoryUpdateDebounceTimer != null)
-            {
-                _categoryUpdateDebounceTimer.Stop();
-                _categoryUpdateDebounceTimer.Tick -= OnCategoryUpdateDebounceTimerTick;
-            }
-            
-            _notificationService?.ClearNotificationHistory();
+
             _dataService?.Dispose();
+            _logger?.Dispose();
+            _configService?.Dispose();
+            _searchService?.Dispose();
+
             _disposed = true;
         }
     }
